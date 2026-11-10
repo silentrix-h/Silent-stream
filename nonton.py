@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import base64
 import subprocess
 from urllib.parse import urlparse
 import requests
@@ -17,15 +18,35 @@ def is_youtube(url):
     domain = parsed.netloc.lower()
     return any(yt in domain for yt in ["youtube.com", "youtu.be", "music.youtube.com"])
 
-def unpack_js(html_text):
-    """Mencari dan mendekode link video yang tersembunyi di dalam JavaScript packed/encoded."""
-    # 1. Cari URL m3u8 atau mp4 dalam format mentah atau terenkripsi
-    pattern = r'(https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*)'
-    matches = re.findall(pattern, html_text)
-    if matches:
-        return matches[0]
+def decode_base64_stream(text):
+    """Mencari dan mendekode string Base64 yang berisi link https://...m3u8 / mp4."""
+    # Cari pola Base64 yang diawali 'aHR0cHM' (artinya 'https://' dalam Base64)
+    b64_matches = re.findall(r'aHR0cHM[A-Za-z0-9+/=]+', text)
+    for b64_str in b64_matches:
+        try:
+            missing_padding = len(b64_str) % 4
+            if missing_padding:
+                b64_str += '=' * (4 - missing_padding)
+            decoded = base64.b64decode(b64_str).decode('utf-8', errors='ignore')
+            if 'http' in decoded and ('.m3u8' in decoded or '.mp4' in decoded or 'stream' in decoded or 'master' in decoded):
+                return decoded
+        except Exception:
+            continue
+    return None
 
-    # 2. Cari pola file / sources di skrip player
+def unpack_js_packer(html_text):
+    """Membongkar JavaScript packed/eval pada player web."""
+    # 1. Coba decode string Base64
+    b64_res = decode_base64_stream(html_text)
+    if b64_res:
+        return b64_res
+
+    # 2. Cari regex m3u8 / mp4 mentah
+    direct_links = re.findall(r'https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*', html_text)
+    if direct_links:
+        return direct_links[0]
+
+    # 3. Cari pola file/sources di JavaScript
     js_patterns = [
         r'file\s*:\s*["\'](https?://[^"\'\s]+)["\']',
         r'src\s*:\s*["\'](https?://[^"\'\s]+)["\']',
@@ -40,13 +61,13 @@ def unpack_js(html_text):
     return None
 
 def extract_video_link(page_url):
-    """Mengekstrak link stream dari web utama & iframe player secara mendalam."""
+    """Mengekstrak link stream secara mendalam dari halaman web utama & iframe player."""
     print("[*] Menganalisis halaman web...")
     try:
         res = requests.get(page_url, headers=HEADERS, timeout=10)
         
         # Cek link direct di halaman utama
-        stream_url = unpack_js(res.text)
+        stream_url = unpack_js_packer(res.text)
         if stream_url:
             print(f"[✓] Ditemukan direct stream: {stream_url}")
             return stream_url
@@ -62,8 +83,7 @@ def extract_video_link(page_url):
             if src.startswith("//"):
                 src = "https:" + src
 
-            # Abaikan widget non-video seperti Discord/iklan
-            if "discord.com" in src or "facebook.com" in src:
+            if any(ignore in src for ignore in ["discord.com", "facebook.com", "disqus.com"]):
                 continue
 
             print(f"[*] Menelusuri iframe player: {src}")
@@ -72,12 +92,13 @@ def extract_video_link(page_url):
                 iframe_headers["Referer"] = page_url
                 iframe_res = requests.get(src, headers=iframe_headers, timeout=10)
 
-                iframe_stream = unpack_js(iframe_res.text)
+                # Dekode isi HTML/JS di dalam iframe (Playmogo, dll)
+                iframe_stream = unpack_js_packer(iframe_res.text)
                 if iframe_stream:
-                    print(f"[✓] Ditemukan stream di dalam player: {iframe_stream}")
+                    print(f"[✓] Berhasil membongkar stream: {iframe_stream}")
                     return iframe_stream
                 
-                # Jika iframe adalah player yang didukung yt-dlp langsung (misal doodstream/streamtape)
+                # Jika provider dikenal yt-dlp secara native
                 if any(p in src for p in ["dood", "streamtape", "filemoon", "streamhider"]):
                     return src
             except Exception:
@@ -93,9 +114,8 @@ def stream_media(url, quality_choice="2", audio_only=False):
     if not is_youtube(url) and not url.endswith(('.mp4', '.m3u8', '.mkv')):
         extracted = extract_video_link(url)
         if not extracted:
-            print("\n[!] Gagal mengambil stream otomatis dari halaman ini.")
-            print("[!] Penyebab: Server player menggunakan enkripsi JS tingkat tinggi.")
-            print("[!] Solusi: Pilih server player lain di web tersebut (misal server Doodstream/Streamtape) lalu tempel link player-nya langsung.\n")
+            print("\n[!] Gagal membongkar stream dari halaman ini.")
+            print("[!] Solusi: Tempelkan link server player lain (misal Doodstream/Streamtape) secara langsung.\n")
             return
         target_url = extracted
 
@@ -110,11 +130,8 @@ def stream_media(url, quality_choice="2", audio_only=False):
             ytdl_format = f"bestvideo[height<={res}]+bestaudio/best[height<={res}]"
             cmd = ["mpv", f"--ytdl-format={ytdl_format}", target_url]
     else:
-        referrer = url if target_url != url else ""
-        http_header = f"User-Agent: {HEADERS['User-Agent']}"
-        if referrer:
-            http_header += f"\r\nReferer: {referrer}"
-
+        # Gunakan User-Agent & Referer agar server video tidak menolak mpv
+        http_header = f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: https://playmogo.com/"
         cmd = [
             "mpv",
             f"--http-header-fields={http_header}",
@@ -135,7 +152,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("       SILENT-STREAM (AUTO WEB SCRAPER v2)        ")
+        print("       SILENT-STREAM (AUTO DECODER v3)            ")
         print("==================================================")
         print("1. Stream Video (YouTube / Link Web Halaman Film / .m3u8)")
         print("2. Stream Audio Saja (Latar Belakang / Music)")
