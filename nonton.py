@@ -89,6 +89,7 @@ def is_valid_mirror_url(url):
     return True
 
 def parse_mirror_value(val):
+    """Mendekode string Base64 Otakudesu & Kuronime dengan penanganan escaped slashes."""
     if not val:
         return None
     val = val.strip()
@@ -99,6 +100,8 @@ def parse_mirror_value(val):
         if missing_padding:
             val += '=' * (4 - missing_padding)
         decoded = base64.b64decode(val).decode('utf-8', errors='ignore')
+        # Hilangkan backslash escape (\/ -> /)
+        decoded = decoded.replace('\\/', '/')
         
         iframe_match = re.search(r'src=["\'](https?://[^"\'\s]+)["\']', decoded)
         if iframe_match:
@@ -162,7 +165,6 @@ def unpack_general_stream(html_text):
     return None
 
 def extract_via_ytdlp(url):
-    """Menggunakan yt-dlp untuk membongkar player seperti Blogger / Google Video / Doodstream."""
     try:
         cmd = ["yt-dlp", "-g", "--no-warnings", url]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12)
@@ -182,16 +184,7 @@ def extract_video_link(page_url):
         mirrors = []
         seen_urls = set()
 
-        # 1. Cek iframe utama di halaman
-        for iframe in soup.find_all('iframe'):
-            src = iframe.get('src') or iframe.get('data-src') or ''
-            if src.startswith('//'):
-                src = 'https:' + src
-            if is_valid_mirror_url(src):
-                seen_urls.add(src)
-                mirrors.append({'name': 'Default Main Player', 'url': src})
-
-        # 2. Tangkap mirror khusus Otakudesu & Kuronime
+        # 1. Ekstrak mirror khusus Otakudesu (.mirrorstream) & Kuronime
         elements = soup.select('.mirrorstream a[data-content], select option[value], button[data-video]')
         for el in elements:
             raw_val = el.get('data-content') or el.get('value') or el.get('data-video') or ''
@@ -208,45 +201,45 @@ def extract_video_link(page_url):
 
                 mirrors.append({'name': server_name or 'Mirror Server', 'url': extracted_url})
 
-        # Jika ditemukan mirror
+        # 2. Cek iframe utama HANYA jika bukan blogger.com
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src') or iframe.get('data-src') or ''
+            if src.startswith('//'):
+                src = 'https:' + src
+            if is_valid_mirror_url(src) and 'blogger.com' not in src and src not in seen_urls:
+                seen_urls.add(src)
+                mirrors.append({'name': 'Default Player', 'url': src})
+
+        # Jika ditemukan mirror yang valid
         if mirrors:
-            target_mirror = None
+            print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
+            for idx, m in enumerate(mirrors, 1):
+                print(f"  {idx}. {m['name']}")
 
-            if len(mirrors) == 1:
-                target_mirror = mirrors[0]['url']
-                print(f"[✓] Memakai player: {mirrors[0]['name']}")
-            else:
-                print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
-                for idx, m in enumerate(mirrors, 1):
-                    print(f"  {idx}. {m['name']} -> ({m['url'][:45]}...)")
+            try:
+                m_choice = input(f"\nPilih Mirror Server [1-{len(mirrors)}] (default 1): ").strip() or "1"
+                selected_m = int(m_choice) - 1
+                if 0 <= selected_m < len(mirrors):
+                    target_mirror = mirrors[selected_m]['url']
+                    print(f"\n[+] Menggunakan Server: {mirrors[selected_m]['name']}")
 
-                try:
-                    m_choice = input(f"\nPilih Mirror Server [1-{len(mirrors)}] (default 1): ").strip() or "1"
-                    selected_m = int(m_choice) - 1
-                    if 0 <= selected_m < len(mirrors):
-                        target_mirror = mirrors[selected_m]['url']
-                        print(f"\n[+] Menggunakan Server: {mirrors[selected_m]['name']}")
-                except Exception:
-                    target_mirror = mirrors[0]['url']
-
-            if target_mirror:
-                # Coba unpack direct link (.mp4 / .m3u8)
-                try:
-                    m_res = requests.get(target_mirror, headers=HEADERS, timeout=10)
+                    # Ambil stream murni dari server mirror (desustream/odcdn/vidhide dll)
+                    m_headers = HEADERS.copy()
+                    m_headers["Referer"] = page_url
+                    m_res = requests.get(target_mirror, headers=m_headers, timeout=10)
+                    
                     unpacked = unpack_general_stream(m_res.text)
                     if unpacked:
+                        print(f"[✓] Direct Stream berhasil diekstrak: {unpacked[:60]}...")
                         return unpacked, target_mirror
-                except Exception:
-                    pass
+                    
+                    ytdlp_url = extract_via_ytdlp(target_mirror)
+                    if ytdlp_url:
+                        return ytdlp_url, target_mirror
 
-                # Jika player berupa Blogger / Embed Web, paksa ekstrak lewat yt-dlp
-                print("[*] Mengonversi embed player via yt-dlp engine...")
-                ytdlp_url = extract_via_ytdlp(target_mirror)
-                if ytdlp_url:
-                    print(f"[✓] Direct Stream Google/Blogger berhasil diekstrak!")
-                    return ytdlp_url, target_mirror
-
-                return target_mirror, page_url
+                    return target_mirror, page_url
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"[!] Gagal ekstraksi web: {e}")
@@ -308,7 +301,6 @@ def stream_media(url, yt_mode="1", audio_only=False):
             print("\n[!] Gagal menemukan stream video otomatis dari web ini.\n")
             return
         
-        # Jika hasil ekstraksi sudah murni direct link (misal googlevideo/mp4), tak perlu lewat 127.0.0.1
         if extracted.endswith(('.mp4', '.m3u8')) or 'googlevideo.com' in extracted:
             play_url = extracted
         else:
@@ -334,7 +326,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (BLOGGER & EMBED FIX v8)       ")
+        print("    SILENT-STREAM (OTAKUDESU MIRROR FIX v9)       ")
         print("==================================================")
         print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
         print("2. Stream Audio Saja (di Background Termux)")
