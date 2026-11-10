@@ -17,38 +17,41 @@ def is_youtube(url):
     domain = parsed.netloc.lower()
     return any(yt in domain for yt in ["youtube.com", "youtu.be", "music.youtube.com"])
 
-def find_stream_in_html(html_text):
-    """Mencari pola file video .m3u8 atau .mp4 di dalam HTML/JS."""
-    # 1. Cari URL berakhiran .m3u8 atau .mp4
-    direct_links = re.findall(r'https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*', html_text)
-    if direct_links:
-        return direct_links[0]
+def unpack_js(html_text):
+    """Mencari dan mendekode link video yang tersembunyi di dalam JavaScript packed/encoded."""
+    # 1. Cari URL m3u8 atau mp4 dalam format mentah atau terenkripsi
+    pattern = r'(https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*)'
+    matches = re.findall(pattern, html_text)
+    if matches:
+        return matches[0]
 
-    # 2. Cari pola file: "http..." atau src: "http..." di dalam tag JavaScript player
-    js_sources = re.findall(r'(?:file|src|source)\s*[:=]\s*["\'](https?://[^"\'\s]+\.(?:m3u8|mp4|mkv)[^"\'\s]*)["\']', html_text, re.IGNORECASE)
-    if js_sources:
-        return js_sources[0]
-
-    # 3. Cari URL apapun yang mengandung m3u8
-    m3u8_any = re.findall(r'https?://[^\s\'"]+m3u8[^\s\'"]*', html_text)
-    if m3u8_any:
-        return m3u8_any[0]
+    # 2. Cari pola file / sources di skrip player
+    js_patterns = [
+        r'file\s*:\s*["\'](https?://[^"\'\s]+)["\']',
+        r'src\s*:\s*["\'](https?://[^"\'\s]+)["\']',
+        r'source\s*src\s*=\s*["\'](https?://[^"\'\s]+)["\']'
+    ]
+    for p in js_patterns:
+        found = re.findall(p, html_text, re.IGNORECASE)
+        for link in found:
+            if ".m3u8" in link or ".mp4" in link:
+                return link
 
     return None
 
 def extract_video_link(page_url):
-    """Mengekstrak link stream secara mendalam dari halaman web utama & iframe player."""
+    """Mengekstrak link stream dari web utama & iframe player secara mendalam."""
     print("[*] Menganalisis halaman web...")
     try:
         res = requests.get(page_url, headers=HEADERS, timeout=10)
         
-        # Cek 1: Apakah ada link stream langsung di halaman utama?
-        stream_url = find_stream_in_html(res.text)
+        # Cek link direct di halaman utama
+        stream_url = unpack_js(res.text)
         if stream_url:
             print(f"[✓] Ditemukan direct stream: {stream_url}")
             return stream_url
 
-        # Cek 2: Jika tidak ada, cari iframe pemutar (seperti playmogo, doodstream, dll)
+        # Cari iframe pemutar (Playmogo, Doodstream, dll)
         soup = BeautifulSoup(res.text, 'html.parser')
         iframes = soup.find_all('iframe')
         
@@ -59,30 +62,42 @@ def extract_video_link(page_url):
             if src.startswith("//"):
                 src = "https:" + src
 
+            # Abaikan widget non-video seperti Discord/iklan
+            if "discord.com" in src or "facebook.com" in src:
+                continue
+
             print(f"[*] Menelusuri iframe player: {src}")
             try:
-                # Request ke dalam iframe dengan Referer dari web utama
                 iframe_headers = HEADERS.copy()
                 iframe_headers["Referer"] = page_url
                 iframe_res = requests.get(src, headers=iframe_headers, timeout=10)
 
-                # Cari stream di dalam kode HTML/JS iframe
-                iframe_stream = find_stream_in_html(iframe_res.text)
+                iframe_stream = unpack_js(iframe_res.text)
                 if iframe_stream:
                     print(f"[✓] Ditemukan stream di dalam player: {iframe_stream}")
                     return iframe_stream
+                
+                # Jika iframe adalah player yang didukung yt-dlp langsung (misal doodstream/streamtape)
+                if any(p in src for p in ["dood", "streamtape", "filemoon", "streamhider"]):
+                    return src
             except Exception:
                 continue
 
     except Exception as e:
-        print(f"[!] Gagal mengekstrak web: {e}")
+        print(f"[!] Gagal ekstraksi web: {e}")
         
-    return page_url
+    return None
 
 def stream_media(url, quality_choice="2", audio_only=False):
     target_url = url
     if not is_youtube(url) and not url.endswith(('.mp4', '.m3u8', '.mkv')):
-        target_url = extract_video_link(url)
+        extracted = extract_video_link(url)
+        if not extracted:
+            print("\n[!] Gagal mengambil stream otomatis dari halaman ini.")
+            print("[!] Penyebab: Server player menggunakan enkripsi JS tingkat tinggi.")
+            print("[!] Solusi: Pilih server player lain di web tersebut (misal server Doodstream/Streamtape) lalu tempel link player-nya langsung.\n")
+            return
+        target_url = extracted
 
     print(f"\n[+] Membuka stream: {target_url}\n")
     
@@ -95,7 +110,6 @@ def stream_media(url, quality_choice="2", audio_only=False):
             ytdl_format = f"bestvideo[height<={res}]+bestaudio/best[height<={res}]"
             cmd = ["mpv", f"--ytdl-format={ytdl_format}", target_url]
     else:
-        # Gunakan User-Agent & Referer agar server video tidak memblokir akses mpv
         referrer = url if target_url != url else ""
         http_header = f"User-Agent: {HEADERS['User-Agent']}"
         if referrer:
@@ -121,7 +135,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("       SILENT-STREAM (DEEP WEB SCRAPER)           ")
+        print("       SILENT-STREAM (AUTO WEB SCRAPER v2)        ")
         print("==================================================")
         print("1. Stream Video (YouTube / Link Web Halaman Film / .m3u8)")
         print("2. Stream Audio Saja (Latar Belakang / Music)")
