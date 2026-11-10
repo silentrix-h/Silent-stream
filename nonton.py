@@ -71,7 +71,6 @@ def is_youtube(url):
     return any(yt in domain for yt in ["youtube.com", "youtu.be", "music.youtube.com"])
 
 def is_episode_url(url):
-    """Memeriksa apakah URL merupakan tautan halaman episode/artikel web."""
     url_lower = url.lower()
     patterns = [r'/episode/', r'-episode-', r'-ep-\d+', r'/ep-\d+', r'episode-\d+', r'eps-\d+']
     for p in patterns:
@@ -80,7 +79,6 @@ def is_episode_url(url):
     return False
 
 def is_valid_mirror_url(url):
-    """Validasi agar hanya URL video player murni yang lolos filter."""
     if not url or not url.startswith('http'):
         return False
     if is_episode_url(url) or '/anime/' in url:
@@ -91,7 +89,6 @@ def is_valid_mirror_url(url):
     return True
 
 def parse_mirror_value(val):
-    """Mendekode nilai Base64 atau mengambil URL iframe murni."""
     if not val:
         return None
     val = val.strip()
@@ -165,9 +162,10 @@ def unpack_general_stream(html_text):
     return None
 
 def extract_via_ytdlp(url):
+    """Menggunakan yt-dlp untuk membongkar player seperti Blogger / Google Video / Doodstream."""
     try:
         cmd = ["yt-dlp", "-g", "--no-warnings", url]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12)
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip().split('\n')[0]
     except Exception:
@@ -184,7 +182,7 @@ def extract_video_link(page_url):
         mirrors = []
         seen_urls = set()
 
-        # 1. Cek iframe utama di halaman (default player)
+        # 1. Cek iframe utama di halaman
         for iframe in soup.find_all('iframe'):
             src = iframe.get('src') or iframe.get('data-src') or ''
             if src.startswith('//'):
@@ -193,7 +191,7 @@ def extract_video_link(page_url):
                 seen_urls.add(src)
                 mirrors.append({'name': 'Default Main Player', 'url': src})
 
-        # 2. Tangkap mirror khusus Otakudesu (.mirrorstream) & Kuronime (option)
+        # 2. Tangkap mirror khusus Otakudesu & Kuronime
         elements = soup.select('.mirrorstream a[data-content], select option[value], button[data-video]')
         for el in elements:
             raw_val = el.get('data-content') or el.get('value') or el.get('data-video') or ''
@@ -210,54 +208,45 @@ def extract_video_link(page_url):
 
                 mirrors.append({'name': server_name or 'Mirror Server', 'url': extracted_url})
 
-        # 3. Fallback: Cari provider video populer jika mirror belum ketemu
-        if not mirrors:
-            video_providers = ['desustream', 'odcdn', 'odstream', 'vidhide', 'dood', 'mp4upload', 'krakenfiles', 'filelions', 'pixeldrain', 'streamtape', 'filemoon', 'streamwish', 'ondesuhd', 'mega']
-            for p in video_providers:
-                matches = re.findall(rf'https?://[^\s\'"\\]*{p}[^\s\'"\\]*', html, re.IGNORECASE)
-                for u in matches:
-                    if is_valid_mirror_url(u) and u not in seen_urls:
-                        seen_urls.add(u)
-                        domain = urlparse(u).netloc
-                        mirrors.append({'name': domain, 'url': u})
-
-        # Jika ditemukan mirror yang valid
+        # Jika ditemukan mirror
         if mirrors:
+            target_mirror = None
+
             if len(mirrors) == 1:
-                target = mirrors[0]['url']
+                target_mirror = mirrors[0]['url']
                 print(f"[✓] Memakai player: {mirrors[0]['name']}")
+            else:
+                print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
+                for idx, m in enumerate(mirrors, 1):
+                    print(f"  {idx}. {m['name']} -> ({m['url'][:45]}...)")
+
                 try:
-                    unpacked = unpack_general_stream(requests.get(target, headers=HEADERS, timeout=10).text)
-                    return unpacked or target, target
+                    m_choice = input(f"\nPilih Mirror Server [1-{len(mirrors)}] (default 1): ").strip() or "1"
+                    selected_m = int(m_choice) - 1
+                    if 0 <= selected_m < len(mirrors):
+                        target_mirror = mirrors[selected_m]['url']
+                        print(f"\n[+] Menggunakan Server: {mirrors[selected_m]['name']}")
                 except Exception:
-                    return target, target
+                    target_mirror = mirrors[0]['url']
 
-            print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
-            for idx, m in enumerate(mirrors, 1):
-                print(f"  {idx}. {m['name']} -> ({m['url'][:45]}...)")
+            if target_mirror:
+                # Coba unpack direct link (.mp4 / .m3u8)
+                try:
+                    m_res = requests.get(target_mirror, headers=HEADERS, timeout=10)
+                    unpacked = unpack_general_stream(m_res.text)
+                    if unpacked:
+                        return unpacked, target_mirror
+                except Exception:
+                    pass
 
-            try:
-                m_choice = input(f"\nPilih Mirror Server [1-{len(mirrors)}] (default 1): ").strip() or "1"
-                selected_m = int(m_choice) - 1
-                if 0 <= selected_m < len(mirrors):
-                    target_mirror = mirrors[selected_m]['url']
-                    print(f"\n[+] Menggunakan Server: {mirrors[selected_m]['name']}")
+                # Jika player berupa Blogger / Embed Web, paksa ekstrak lewat yt-dlp
+                print("[*] Mengonversi embed player via yt-dlp engine...")
+                ytdlp_url = extract_via_ytdlp(target_mirror)
+                if ytdlp_url:
+                    print(f"[✓] Direct Stream Google/Blogger berhasil diekstrak!")
+                    return ytdlp_url, target_mirror
 
-                    try:
-                        m_res = requests.get(target_mirror, headers=HEADERS, timeout=10)
-                        unpacked = unpack_general_stream(m_res.text)
-                        if unpacked:
-                            return unpacked, target_mirror
-                    except Exception:
-                        pass
-
-                    ytdlp_url = extract_via_ytdlp(target_mirror)
-                    if ytdlp_url:
-                        return ytdlp_url, target_mirror
-
-                    return target_mirror, page_url
-            except Exception:
-                pass
+                return target_mirror, page_url
 
     except Exception as e:
         print(f"[!] Gagal ekstraksi web: {e}")
@@ -316,11 +305,15 @@ def stream_media(url, yt_mode="1", audio_only=False):
     elif not target_url.endswith(('.mp4', '.m3u8', '.mkv')):
         extracted, referer = extract_video_link(target_url)
         if not extracted:
-            print("\n[!] Gagal menemukan stream video otomatis dari web ini.")
-            print("[!] Web ini mungkin menggunakan proteksi player khusus/JS dinamis.\n")
+            print("\n[!] Gagal menemukan stream video otomatis dari web ini.\n")
             return
-        print("[*] Menjalankan Local Relay Streamer...")
-        play_url = start_local_proxy(extracted, referer)
+        
+        # Jika hasil ekstraksi sudah murni direct link (misal googlevideo/mp4), tak perlu lewat 127.0.0.1
+        if extracted.endswith(('.mp4', '.m3u8')) or 'googlevideo.com' in extracted:
+            play_url = extracted
+        else:
+            print("[*] Menjalankan Local Relay Streamer...")
+            play_url = start_local_proxy(extracted, referer)
     else:
         play_url = target_url
 
@@ -341,7 +334,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (FILTERED MIRROR SCRAPER v7)    ")
+        print("    SILENT-STREAM (BLOGGER & EMBED FIX v8)       ")
         print("==================================================")
         print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
         print("2. Stream Audio Saja (di Background Termux)")
