@@ -6,10 +6,63 @@ import subprocess
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
+import http.server
+import socketserver
+import threading
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+
+server_instance = None
+
+def start_local_proxy(remote_url, referer_url, port=8888):
+    """Menjalankan proxy lokal sementara di 127.0.0.1 agar pemutar HP bisa memutar video CDN terproteksi."""
+    global server_instance
+    if server_instance:
+        try:
+            server_instance.shutdown()
+        except Exception:
+            pass
+
+    class ProxyHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            req_headers = {
+                "User-Agent": HEADERS["User-Agent"],
+                "Referer": referer_url if referer_url else remote_url
+            }
+            if "Range" in self.headers:
+                req_headers["Range"] = self.headers["Range"]
+
+            try:
+                resp = requests.get(remote_url, headers=req_headers, stream=True, timeout=15)
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() in ["content-type", "content-length", "accept-ranges", "content-range"]:
+                        self.send_header(k, v)
+                self.end_headers()
+
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        self.wfile.write(chunk)
+            except Exception:
+                pass
+
+        def log_message(self, format, *args):
+            return  # Matikan log ke terminal
+
+    try:
+        class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        server_instance = ThreadedTCPServer(('127.0.0.1', port), ProxyHandler)
+        t = threading.Thread(target=server_instance.serve_forever)
+        t.daemon = True
+        t.start()
+        return f"http://127.0.0.1:{port}"
+    except Exception:
+        return remote_url
 
 def is_youtube(url):
     parsed = urlparse(url)
@@ -71,7 +124,6 @@ def extract_video_link(page_url):
     return page_url, page_url
 
 def get_youtube_stream_link(url, quality_choice="2"):
-    """Mengambil direct stream link YouTube menggunakan yt-dlp sesuai resolusi."""
     print("[*] Mengambil link stream YouTube...")
     res_map = {"1": "1080", "2": "720", "3": "480", "4": "360"}
     res = res_map.get(quality_choice, "720")
@@ -91,24 +143,20 @@ def stream_media(url, quality_choice="2", audio_only=False):
 
     if is_youtube(url):
         target_url = get_youtube_stream_link(url, quality_choice)
+        play_url = target_url
     elif not url.endswith(('.mp4', '.m3u8', '.mkv')):
         target_url, referer = extract_video_link(url)
+        print("[*] Menjalankan Local Relay Streamer...")
+        play_url = start_local_proxy(target_url, referer)
+    else:
+        play_url = target_url
 
-    print(f"\n[+] Membuka Video Player HP: {target_url}\n")
+    print(f"\n[+] Membuka Video Player HP: {play_url}\n")
     
     if audio_only:
         cmd = ["mpv", "--no-video", target_url]
     else:
-        # Kirim header Referer & User-Agent ke Intent Android agar tidak diblokir CDN server
-        headers_str = f"Referer: {referer},User-Agent: {HEADERS['User-Agent']}"
-        cmd = [
-            "am", "start",
-            "-a", "android.intent.action.VIEW",
-            "-d", target_url,
-            "-t", "video/*",
-            "--esa", "headers", headers_str,
-            "--esa", "input-headers", headers_str
-        ]
+        cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_url, "-t", "video/*"]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -120,10 +168,10 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("      SILENT-STREAM (STREAM PLAYER FIX v4)        ")
+        print("      SILENT-STREAM (LOCAL RELAY STREAMER)        ")
         print("==================================================")
-        print("1. Stream Video (Buka di Video Player HP)")
-        print("2. Stream Audio Saja (Latar Belakang / MP3)")
+        print("1. Stream Video (Buka di Pemutar Video HP)")
+        print("2. Stream Audio Saja (di Background Termux)")
         print("0. Keluar")
         
         choice = input("\nPilihan [1/2/0]: ").strip()
