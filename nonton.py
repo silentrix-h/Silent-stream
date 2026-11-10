@@ -78,28 +78,13 @@ def is_episode_url(url):
             return True
     return False
 
-def is_valid_mirror_url(url):
-    """Filter ketat untuk membuang link iklan, blogs, blogger, dan tautan non-video."""
-    if not url or not url.startswith('http'):
-        return False
-    url_lower = url.lower()
-    blacklisted = [
-        'blogger.com', 'blogs', 'facebook.com', 'discord.com', 'twitter.com', 'disqus.com', 
-        'whatsapp.com', 'ads.', 'googleads', 'doubleclick', 'otakudesu.blog/episode', 
-        'kuronime.sbs/anime', 'link.desustream.com'
-    ]
-    if any(b in url_lower for b in blacklisted):
-        return False
-    if is_episode_url(url) or '/anime/' in url_lower:
-        return False
-    return True
-
 def parse_mirror_value(val):
+    """Mendekode nilai Base64 atau URL dari atribut HTML mirror."""
     if not val:
         return None
     val = val.strip()
     if val.startswith('http'):
-        return val if is_valid_mirror_url(val) else None
+        return val
     try:
         missing_padding = len(val) % 4
         if missing_padding:
@@ -109,13 +94,11 @@ def parse_mirror_value(val):
         
         iframe_match = re.search(r'src=["\'](https?://[^"\'\s]+)["\']', decoded)
         if iframe_match:
-            u = iframe_match.group(1)
-            return u if is_valid_mirror_url(u) else None
+            return iframe_match.group(1)
             
         url_match = re.search(r'https?://[^\s\'"<>\\]+', decoded)
         if url_match:
-            u = url_match.group(1)
-            return u if is_valid_mirror_url(u) else None
+            return url_match.group(1)
     except Exception:
         pass
     return None
@@ -183,7 +166,7 @@ def extract_via_ytdlp(url):
     return None
 
 def extract_video_link(page_url):
-    print("[*] Menganalisis player video & mirror server (Prioritas: Ondesuhd / Desustream)...")
+    print("[*] Menganalisis player video & mirror server Otakudesu...")
     try:
         res = requests.get(page_url, headers=HEADERS, timeout=10)
         html = res.text
@@ -192,38 +175,45 @@ def extract_video_link(page_url):
         mirrors = []
         seen_urls = set()
 
-        # 1. PRIORTAS UTAMA: Pindai kotak Mirrorstream Otakudesu / Kuronime (.mirrorstream a)
-        elements = soup.select('.mirrorstream a[data-content], select option[value], button[data-video]')
+        # 1. Pindai Kotak Mirrorstream Otakudesu (.mirrorstream a, .mirrorstream option)
+        elements = soup.select('.mirrorstream a[data-content], select option[value], button[data-video], .mirrorstream a[href]')
         for el in elements:
-            raw_val = el.get('data-content') or el.get('value') or el.get('data-video') or ''
+            raw_val = el.get('data-content') or el.get('value') or el.get('data-video') or el.get('href') or ''
             extracted_url = parse_mirror_value(raw_val)
 
-            if extracted_url and is_valid_mirror_url(extracted_url) and extracted_url not in seen_urls:
-                seen_urls.add(extracted_url)
+            if extracted_url and extracted_url.startswith('http') and extracted_url not in seen_urls:
+                # Abaikan hanya iklan murni & sosial media
+                if not any(ign in extracted_url.lower() for ign in ['facebook.com', 'discord.com', 'twitter.com', 'disqus.com', 'googleads', 'doubleclick']):
+                    if extracted_url != page_url and not extracted_url.endswith('/episode/'):
+                        seen_urls.add(extracted_url)
 
-                server_name = el.get_text(strip=True)
-                res_prefix = ""
-                parent_ul = el.find_parent('ul')
-                if parent_ul and parent_ul.get('class'):
-                    res_prefix = f"[{' '.join(parent_ul.get('class')).upper()}] "
+                        server_name = el.get_text(strip=True)
+                        res_prefix = ""
+                        parent_ul = el.find_parent('ul')
+                        if parent_ul and parent_ul.get('class'):
+                            res_prefix = f"[{' '.join(parent_ul.get('class')).upper()}] "
 
-                full_name = f"{res_prefix}{server_name}"
-                
-                # Masukkan ke urutan teratas jika itu ondesuhd / desustream / odstream
-                if any(fav in full_name.lower() or fav in extracted_url.lower() for fav in ['ondesuhd', 'odstream', 'odcdn']):
-                    mirrors.insert(0, {'name': full_name, 'url': extracted_url})
-                else:
-                    mirrors.append({'name': full_name, 'url': extracted_url})
+                        full_name = f"{res_prefix}{server_name}".strip()
+                        if not full_name:
+                            full_name = urlparse(extracted_url).netloc
 
-        # 2. PRIORTAS KEDUA: Iframe utama (HANYA JIKA BUKAN BLOGGER/BLOGS)
-        for iframe in soup.find_all('iframe'):
-            src = iframe.get('src') or iframe.get('data-src') or ''
-            if src.startswith('//'):
-                src = 'https:' + src
-            if is_valid_mirror_url(src) and src not in seen_urls:
-                seen_urls.add(src)
-                domain = urlparse(src).netloc
-                mirrors.append({'name': f"Main Player ({domain})", 'url': src})
+                        # Prioritaskan Ondesuhd / Desustream ke paling atas
+                        if any(fav in full_name.lower() or fav in extracted_url.lower() for fav in ['ondesuhd', 'desustream', 'odcdn', 'odstream', 'vidhide']):
+                            mirrors.insert(0, {'name': full_name, 'url': extracted_url})
+                        else:
+                            mirrors.append({'name': full_name, 'url': extracted_url})
+
+        # 2. Tangkap iframe jika mirrorstream tidak terdeteksi
+        if not mirrors:
+            for iframe in soup.find_all('iframe'):
+                src = iframe.get('src') or iframe.get('data-src') or ''
+                if src.startswith('//'):
+                    src = 'https:' + src
+                if src.startswith('http') and src not in seen_urls:
+                    if not any(ign in src.lower() for ign in ['facebook.com', 'discord.com', 'disqus.com']):
+                        seen_urls.add(src)
+                        domain = urlparse(src).netloc
+                        mirrors.append({'name': f"Main Player ({domain})", 'url': src})
 
         # Jika ditemukan mirror
         if mirrors:
@@ -243,12 +233,22 @@ def extract_video_link(page_url):
 
             print(f"\n[*] Menguraikan stream dari player: {target_mirror[:55]}...")
             
-            # Request ke URL player Desustream / Vidhide / Odstream
+            # Request ke halaman Desustream / Vidhide untuk mengambil stream murni
             try:
                 m_headers = HEADERS.copy()
                 m_headers["Referer"] = page_url
                 m_res = requests.get(target_mirror, headers=m_headers, timeout=10)
                 
+                # Cek jika di dalam desustream ada iframe bersarang
+                m_soup = BeautifulSoup(m_res.text, 'html.parser')
+                nested_iframe = m_soup.find('iframe')
+                if nested_iframe:
+                    n_src = nested_iframe.get('src') or nested_iframe.get('data-src') or ''
+                    if n_src.startswith('//'):
+                        n_src = 'https:' + n_src
+                    if n_src.startswith('http'):
+                        m_res = requests.get(n_src, headers=m_headers, timeout=10)
+
                 unpacked = unpack_general_stream(m_res.text)
                 if unpacked:
                     print(f"[✓] Direct Stream (.m3u8/.mp4) berhasil diekstrak!")
@@ -344,7 +344,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (ONDESUHD PRIORITY v12)         ")
+        print("    SILENT-STREAM (DESUSTREAM UNBLOCKED v13)      ")
         print("==================================================")
         print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
         print("2. Stream Audio Saja (di Background Termux)")
