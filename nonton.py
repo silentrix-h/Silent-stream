@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 import os
+import re
 import sys
 import subprocess
 from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
 
 def is_youtube(url):
     """Mendeteksi link YouTube / YT Music."""
@@ -10,7 +13,54 @@ def is_youtube(url):
     domain = parsed.netloc.lower()
     return any(yt in domain for yt in ["youtube.com", "youtu.be", "music.youtube.com"])
 
+def extract_video_link(page_url):
+    """Mengekstrak link stream (.m3u8/.mp4/iframe) dari halaman web biasa."""
+    print("[*] Menganalisis & mengekstrak link video dari halaman web...")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        response = requests.get(page_url, headers=headers, timeout=10)
+        html = response.text
+
+        # 1. Cari link stream langsung (.m3u8 atau .mp4) di dalam script/HTML
+        direct_links = re.findall(r'https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*', html)
+        if direct_links:
+            print(f"[✓] Ditemukan link direct stream: {direct_links[0]}")
+            return direct_links[0]
+
+        # 2. Cari link iframe player (misal: Doodstream, Streamtape, Filemoon, dll)
+        soup = BeautifulSoup(html, 'html.parser')
+        iframes = soup.find_all('iframe')
+        
+        for iframe in iframes:
+            src = iframe.get('src')
+            if src:
+                if src.startswith("//"):
+                    src = "https:" + src
+                if any(provider in src for provider in ["dood", "streamtape", "filemoon", "streamhider", "player", "embed"]):
+                    print(f"[✓] Ditemukan server player: {src}")
+                    return src
+
+        # Jika ada iframe apapun
+        if iframes and iframes[0].get('src'):
+            src = iframes[0].get('src')
+            if src.startswith("//"):
+                src = "https:" + src
+            print(f"[✓] Ditemukan iframe embed: {src}")
+            return src
+
+    except Exception as e:
+        print(f"[!] Gagal mengekstrak web: {e}")
+        
+    return page_url  # Kembalikan URL asli jika scraping tidak menemukan iframe
+
 def stream_media(url, quality_choice="2", audio_only=False):
+    # Jika bukan YouTube, coba ekstrak link videonya dari halaman web
+    if not is_youtube(url) and not url.endswith(('.mp4', '.m3u8', '.mkv')):
+        url = extract_video_link(url)
+
     print(f"\n[+] Membuka stream untuk: {url}\n")
     
     if is_youtube(url):
@@ -22,7 +72,6 @@ def stream_media(url, quality_choice="2", audio_only=False):
             ytdl_format = f"bestvideo[height<={res}]+bestaudio/best[height<={res}]"
             cmd = ["mpv", f"--ytdl-format={ytdl_format}", url]
     else:
-        # Link direct (.m3u8 film bioskop, .mp4, .mkv, dll)
         if audio_only:
             cmd = ["mpv", "--no-video", url]
         else:
@@ -32,7 +81,7 @@ def stream_media(url, quality_choice="2", audio_only=False):
         subprocess.run(cmd)
         print("\n[✓] Stream selesai/ditutup.\n")
     except FileNotFoundError:
-        print("\n[!] Program 'mpv' belum terinstal. Jalankan 'pkg install mpv -y'.")
+        print("\n[!] Program 'mpv' belum terinstal.")
     except Exception as e:
         print(f"\n[!] Gagal memutar stream: {e}")
 
@@ -40,16 +89,16 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("          SILENT-STREAM (NONTON PLAYER)           ")
+        print("          SILENT-STREAM (AUTO WEB SCRAPER)        ")
         print("==================================================")
-        print("1. Stream Video (YouTube / Link Film .m3u8 / MP4 Direct)")
+        print("1. Stream Video (YouTube / Link Web Halaman Film / .m3u8)")
         print("2. Stream Audio Saja (Latar Belakang / Music)")
         print("0. Keluar")
         
         choice = input("\nPilihan [1/2/0]: ").strip()
 
         if choice in ["0", "exit", "q"]:
-            print("\nTerima kasih! Sampai jumpa.")
+            print("\nTerima kasih!")
             break
         
         elif choice == "1":
