@@ -78,6 +78,46 @@ def is_episode_url(url):
             return True
     return False
 
+def is_valid_mirror_url(url):
+    """Filter ketat untuk membuang link iklan, blogger, dan tautan non-video."""
+    if not url or not url.startswith('http'):
+        return False
+    url_lower = url.lower()
+    blacklisted = [
+        'blogger.com', 'facebook.com', 'discord.com', 'twitter.com', 'disqus.com', 
+        'whatsapp.com', 'ads.', 'googleads', 'doubleclick', 'otakudesu.blog/episode', 
+        'kuronime.sbs/anime', 'link.desustream.com'
+    ]
+    if any(b in url_lower for b in blacklisted):
+        return False
+    if is_episode_url(url) or '/anime/' in url_lower:
+        return False
+    return True
+
+def parse_mirror_value(val):
+    if not val:
+        return None
+    val = val.strip()
+    if val.startswith('http'):
+        return val
+    try:
+        missing_padding = len(val) % 4
+        if missing_padding:
+            val += '=' * (4 - missing_padding)
+        decoded = base64.b64decode(val).decode('utf-8', errors='ignore')
+        decoded = decoded.replace('\\/', '/')
+        
+        iframe_match = re.search(r'src=["\'](https?://[^"\'\s]+)["\']', decoded)
+        if iframe_match:
+            return iframe_match.group(1)
+            
+        url_match = re.search(r'https?://[^\s\'"<>\\]+', decoded)
+        if url_match:
+            return url_match.group(1)
+    except Exception:
+        pass
+    return None
+
 def scan_anime_episodes(anime_url):
     print("\n[*] Menganalisis halaman anime & memindai daftar episode...")
     try:
@@ -112,6 +152,7 @@ def scan_anime_episodes(anime_url):
         return []
 
 def unpack_general_stream(html_text):
+    """Mencari direct link .m3u8 / .mp4 / JSON file di dalam HTML player."""
     direct_links = re.findall(r'https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*', html_text)
     if direct_links:
         return direct_links[0]
@@ -119,20 +160,20 @@ def unpack_general_stream(html_text):
     js_patterns = [
         r'file\s*:\s*["\'](https?://[^"\'\s]+)["\']',
         r'src\s*:\s*["\'](https?://[^"\'\s]+)["\']',
+        r'sources\s*:\s*\[\{\s*file\s*:\s*["\'](https?://[^"\'\s]+)["\']',
         r'source\s*src\s*=\s*["\'](https?://[^"\'\s]+)["\']'
     ]
     for p in js_patterns:
         found = re.findall(p, html_text, re.IGNORECASE)
         for link in found:
-            if ".m3u8" in link or ".mp4" in link:
+            if ".m3u8" in link or ".mp4" in link or "googlevideo" in link:
                 return link
     return None
 
 def extract_via_ytdlp(url):
-    """Menggunakan yt-dlp untuk membongkar player seperti Blogger / Google Video / Doodstream / Vidhide."""
     try:
         cmd = ["yt-dlp", "-g", "--no-warnings", url]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12)
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip().split('\n')[0]
     except Exception:
@@ -140,7 +181,7 @@ def extract_via_ytdlp(url):
     return None
 
 def extract_video_link(page_url):
-    print("[*] Menganalisis player video & iframe...")
+    print("[*] Menganalisis player video & mirror server...")
     try:
         res = requests.get(page_url, headers=HEADERS, timeout=10)
         html = res.text
@@ -149,32 +190,48 @@ def extract_video_link(page_url):
         mirrors = []
         seen_urls = set()
 
-        # 1. Ambil semua iframe di halaman (termasuk Blogger / Desustream / Odstream)
+        # 1. Ekstrak dari iframe player utama (Desustream, Odstream, Vidhide, dll)
         for iframe in soup.find_all('iframe'):
             src = iframe.get('src') or iframe.get('data-src') or ''
             if src.startswith('//'):
                 src = 'https:' + src
-            
-            if src and src.startswith('http') and src not in seen_urls:
-                if not any(ign in src.lower() for ign in ['facebook.com', 'discord.com', 'disqus.com']):
-                    seen_urls.add(src)
-                    domain = urlparse(src).netloc
-                    mirrors.append({'name': f"Main Player ({domain})", 'url': src})
+            if is_valid_mirror_url(src) and src not in seen_urls:
+                seen_urls.add(src)
+                domain = urlparse(src).netloc
+                mirrors.append({'name': f"Main Player ({domain})", 'url': src})
 
-        # 2. Cari tautan player tambahan dalam HTML
-        providers = ['blogger.com', 'desustream', 'odcdn', 'odstream', 'vidhide', 'dood', 'mp4upload', 'krakenfiles', 'filelions', 'pixeldrain', 'streamtape']
-        for p in providers:
-            found = re.findall(rf'https?://[^\s\'"\\]*{p}[^\s\'"\\]*', html, re.IGNORECASE)
-            for u in found:
-                u = u.replace('\\/', '/')
-                if u not in seen_urls:
-                    seen_urls.add(u)
-                    domain = urlparse(u).netloc
-                    mirrors.append({'name': f"Server {domain}", 'url': u})
+        # 2. Ekstrak dari opsi selector mirror Otakudesu / Kuronime
+        elements = soup.select('.mirrorstream a[data-content], select option[value], button[data-video]')
+        for el in elements:
+            raw_val = el.get('data-content') or el.get('value') or el.get('data-video') or ''
+            extracted_url = parse_mirror_value(raw_val)
 
-        # Jika ditemukan mirror/iframe player
+            if extracted_url and is_valid_mirror_url(extracted_url) and extracted_url not in seen_urls:
+                seen_urls.add(extracted_url)
+
+                server_name = el.get_text(strip=True)
+                parent_ul = el.find_parent('ul')
+                if parent_ul and parent_ul.get('class'):
+                    res_tag = " ".join(parent_ul.get('class')).upper()
+                    server_name = f"{res_tag} - {server_name}"
+
+                mirrors.append({'name': server_name or 'Mirror Server', 'url': extracted_url})
+
+        # 3. Fallback regex khusus server player populer
+        if not mirrors:
+            providers = ['desustream.net/dstream', 'desustream.me/dstream', 'odcdn', 'odstream', 'vidhide', 'dood', 'mp4upload', 'filelions', 'streamtape']
+            for p in providers:
+                found = re.findall(rf'https?://[^\s\'"\\]*{p}[^\s\'"\\]*', html, re.IGNORECASE)
+                for u in found:
+                    u = u.replace('\\/', '/')
+                    if is_valid_mirror_url(u) and u not in seen_urls:
+                        seen_urls.add(u)
+                        domain = urlparse(u).netloc
+                        mirrors.append({'name': f"Server {domain}", 'url': u})
+
+        # Jika ditemukan mirror
         if mirrors:
-            print(f"\n[✓] Ditemukan {len(mirrors)} Player Video:")
+            print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
             for idx, m in enumerate(mirrors, 1):
                 print(f"  {idx}. {m['name']}")
 
@@ -188,35 +245,32 @@ def extract_video_link(page_url):
                 except Exception:
                     pass
 
-            print(f"\n[*] Menguraikan stream dari player: {target_mirror[:50]}...")
+            print(f"\n[*] Menguraikan stream dari player: {target_mirror[:55]}...")
             
-            # Coba ekstrak direct link via yt-dlp (Blogger / Google Video)
-            ytdlp_url = extract_via_ytdlp(target_mirror)
-            if ytdlp_url:
-                print(f"[✓] Direct Stream Google/Blogger berhasil diekstrak!")
-                return ytdlp_url, target_mirror
-
-            # Jika yt-dlp mentok, coba baca HTML iframe-nya
+            # Request ke URL player Desustream / Vidhide / Odstream
             try:
                 m_headers = HEADERS.copy()
                 m_headers["Referer"] = page_url
                 m_res = requests.get(target_mirror, headers=m_headers, timeout=10)
+                
                 unpacked = unpack_general_stream(m_res.text)
                 if unpacked:
-                    print(f"[✓] Direct Stream berhasil diekstrak: {unpacked[:60]}...")
+                    print(f"[✓] Direct Stream (.m3u8/.mp4) berhasil diekstrak!")
                     return unpacked, target_mirror
             except Exception:
                 pass
 
-            return target_mirror, page_url
+            ytdlp_url = extract_via_ytdlp(target_mirror)
+            if ytdlp_url:
+                print(f"[✓] Direct Stream berhasil diekstrak via yt-dlp!")
+                return ytdlp_url, target_mirror
+
+            # Jika target_mirror bukan direct link .mp4/.m3u8, kembalikan target_mirror hanya jika itu link embed murni
+            if any(ext in target_mirror for ext in ['.mp4', '.m3u8']) or 'googlevideo' in target_mirror:
+                return target_mirror, page_url
 
     except Exception as e:
         print(f"[!] Gagal ekstraksi web: {e}")
-
-    # Fallback terakhir ke halaman utama via yt-dlp
-    ytdlp_fallback = extract_via_ytdlp(page_url)
-    if ytdlp_fallback:
-        return ytdlp_fallback, page_url
 
     return None, page_url
 
@@ -268,7 +322,8 @@ def stream_media(url, yt_mode="1", audio_only=False):
     elif not target_url.endswith(('.mp4', '.m3u8', '.mkv')):
         extracted, referer = extract_video_link(target_url)
         if not extracted:
-            print("\n[!] Gagal menemukan stream video otomatis dari web ini.\n")
+            print("\n[!] Gagal menemukan stream video murni (.m3u8 / .mp4) dari web ini.")
+            print("[!] Web ini menggunakan proteksi JS khusus/Blogger HTML murni.\n")
             return
         
         if extracted.endswith(('.mp4', '.m3u8')) or 'googlevideo.com' in extracted:
@@ -296,7 +351,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (BLOGGER EXTRACTOR v10)         ")
+        print("    SILENT-STREAM (DESUSTREAM FILTER v11)         ")
         print("==================================================")
         print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
         print("2. Stream Audio Saja (di Background Termux)")
