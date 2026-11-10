@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import json
 import base64
 import subprocess
 from urllib.parse import urlparse
@@ -78,31 +79,6 @@ def is_episode_url(url):
             return True
     return False
 
-def parse_mirror_value(val):
-    """Mendekode nilai Base64 atau URL dari atribut HTML mirror."""
-    if not val:
-        return None
-    val = val.strip()
-    if val.startswith('http'):
-        return val
-    try:
-        missing_padding = len(val) % 4
-        if missing_padding:
-            val += '=' * (4 - missing_padding)
-        decoded = base64.b64decode(val).decode('utf-8', errors='ignore')
-        decoded = decoded.replace('\\/', '/')
-        
-        iframe_match = re.search(r'src=["\'](https?://[^"\'\s]+)["\']', decoded)
-        if iframe_match:
-            return iframe_match.group(1)
-            
-        url_match = re.search(r'https?://[^\s\'"<>\\]+', decoded)
-        if url_match:
-            return url_match.group(1)
-    except Exception:
-        pass
-    return None
-
 def scan_anime_episodes(anime_url):
     print("\n[*] Menganalisis halaman anime & memindai daftar episode...")
     try:
@@ -137,7 +113,6 @@ def scan_anime_episodes(anime_url):
         return []
 
 def unpack_general_stream(html_text):
-    """Mencari direct link .m3u8 / .mp4 di dalam HTML player."""
     direct_links = re.findall(r'https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*', html_text)
     if direct_links:
         return direct_links[0]
@@ -155,6 +130,57 @@ def unpack_general_stream(html_text):
                 return link
     return None
 
+def resolve_otakudesu_ajax(page_url, data_content):
+    """Menembak AJAX wp-admin/admin-ajax.php Otakudesu untuk mendapatkan iframe player asli."""
+    try:
+        parsed_base = urlparse(page_url)
+        ajax_url = f"{parsed_base.scheme}://{parsed_base.netloc}/wp-admin/admin-ajax.php"
+        
+        missing_padding = len(data_content) % 4
+        if missing_padding:
+            data_content += '=' * (4 - missing_padding)
+        decoded = base64.b64decode(data_content).decode('utf-8', errors='ignore')
+
+        payload = {}
+        if decoded.startswith('{'):
+            payload = json.loads(decoded)
+        else:
+            for pair in decoded.split('&'):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    payload[k] = v
+
+        if not payload:
+            return None
+
+        ajax_headers = HEADERS.copy()
+        ajax_headers.update({
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": page_url
+        })
+
+        resp = requests.post(ajax_url, data=payload, headers=ajax_headers, timeout=10)
+        
+        iframe_match = re.search(r'src=["\'](https?://[^"\'\s]+)["\']', resp.text)
+        if iframe_match:
+            return iframe_match.group(1)
+
+        b64_iframe = re.search(r'aHR0c[A-Za-z0-9+/=]+', resp.text)
+        if b64_iframe:
+            b_str = b64_iframe.group(0)
+            missing = len(b_str) % 4
+            if missing:
+                b_str += '=' * (4 - missing)
+            dec_resp = base64.b64decode(b_str).decode('utf-8', errors='ignore')
+            m = re.search(r'https?://[^\s\'"<>\\]+', dec_resp)
+            if m:
+                return m.group(0).replace('\\/', '/')
+
+    except Exception:
+        pass
+    return None
+
 def extract_via_ytdlp(url):
     try:
         cmd = ["yt-dlp", "-g", "--no-warnings", url]
@@ -169,53 +195,43 @@ def extract_video_link(page_url):
     print("[*] Menganalisis player video & mirror server Otakudesu...")
     try:
         res = requests.get(page_url, headers=HEADERS, timeout=10)
-        html = res.text
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = BeautifulSoup(res.text, 'html.parser')
 
         mirrors = []
-        seen_urls = set()
+        seen = set()
 
-        # 1. Pindai Kotak Mirrorstream Otakudesu (.mirrorstream a, .mirrorstream option)
-        elements = soup.select('.mirrorstream a[data-content], select option[value], button[data-video], .mirrorstream a[href]')
-        for el in elements:
-            raw_val = el.get('data-content') or el.get('value') or el.get('data-video') or el.get('href') or ''
-            extracted_url = parse_mirror_value(raw_val)
+        # 1. Pindai khusus elemen di dalam div.mirrorstream (Otakudesu)
+        mirror_div = soup.find('div', class_='mirrorstream')
+        if mirror_div:
+            for ul in mirror_div.find_all('ul'):
+                res_class = " ".join(ul.get('class', [])).upper()
+                for a in ul.find_all('a'):
+                    data_content = a.get('data-content', '')
+                    name = a.get_text(strip=True)
 
-            if extracted_url and extracted_url.startswith('http') and extracted_url not in seen_urls:
-                # Abaikan hanya iklan murni & sosial media
-                if not any(ign in extracted_url.lower() for ign in ['facebook.com', 'discord.com', 'twitter.com', 'disqus.com', 'googleads', 'doubleclick']):
-                    if extracted_url != page_url and not extracted_url.endswith('/episode/'):
-                        seen_urls.add(extracted_url)
+                    if name.lower() in seen or 'episode' in name.lower():
+                        continue
 
-                        server_name = el.get_text(strip=True)
-                        res_prefix = ""
-                        parent_ul = el.find_parent('ul')
-                        if parent_ul and parent_ul.get('class'):
-                            res_prefix = f"[{' '.join(parent_ul.get('class')).upper()}] "
+                    if data_content:
+                        target_url = resolve_otakudesu_ajax(page_url, data_content)
+                        if target_url:
+                            seen.add(name.lower())
+                            label = f"[{res_class}] {name}"
+                            if any(fav in name.lower() or fav in target_url.lower() for fav in ['ondesuhd', 'desustream', 'odstream']):
+                                mirrors.insert(0, {'name': label, 'url': target_url})
+                            else:
+                                mirrors.append({'name': label, 'url': target_url})
 
-                        full_name = f"{res_prefix}{server_name}".strip()
-                        if not full_name:
-                            full_name = urlparse(extracted_url).netloc
-
-                        # Prioritaskan Ondesuhd / Desustream ke paling atas
-                        if any(fav in full_name.lower() or fav in extracted_url.lower() for fav in ['ondesuhd', 'desustream', 'odcdn', 'odstream', 'vidhide']):
-                            mirrors.insert(0, {'name': full_name, 'url': extracted_url})
-                        else:
-                            mirrors.append({'name': full_name, 'url': extracted_url})
-
-        # 2. Tangkap iframe jika mirrorstream tidak terdeteksi
+        # 2. Tangkap iframe utama jika mirrorstream kosong (Web Lain / Standar)
         if not mirrors:
             for iframe in soup.find_all('iframe'):
                 src = iframe.get('src') or iframe.get('data-src') or ''
                 if src.startswith('//'):
                     src = 'https:' + src
-                if src.startswith('http') and src not in seen_urls:
-                    if not any(ign in src.lower() for ign in ['facebook.com', 'discord.com', 'disqus.com']):
-                        seen_urls.add(src)
-                        domain = urlparse(src).netloc
-                        mirrors.append({'name': f"Main Player ({domain})", 'url': src})
+                if src.startswith('http') and 'blogger.com' not in src:
+                    domain = urlparse(src).netloc
+                    mirrors.append({'name': f"Main Player ({domain})", 'url': src})
 
-        # Jika ditemukan mirror
         if mirrors:
             print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
             for idx, m in enumerate(mirrors, 1):
@@ -233,21 +249,10 @@ def extract_video_link(page_url):
 
             print(f"\n[*] Menguraikan stream dari player: {target_mirror[:55]}...")
             
-            # Request ke halaman Desustream / Vidhide untuk mengambil stream murni
             try:
                 m_headers = HEADERS.copy()
                 m_headers["Referer"] = page_url
                 m_res = requests.get(target_mirror, headers=m_headers, timeout=10)
-                
-                # Cek jika di dalam desustream ada iframe bersarang
-                m_soup = BeautifulSoup(m_res.text, 'html.parser')
-                nested_iframe = m_soup.find('iframe')
-                if nested_iframe:
-                    n_src = nested_iframe.get('src') or nested_iframe.get('data-src') or ''
-                    if n_src.startswith('//'):
-                        n_src = 'https:' + n_src
-                    if n_src.startswith('http'):
-                        m_res = requests.get(n_src, headers=m_headers, timeout=10)
 
                 unpacked = unpack_general_stream(m_res.text)
                 if unpacked:
@@ -344,7 +349,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (DESUSTREAM UNBLOCKED v13)      ")
+        print("    SILENT-STREAM (OTAKUDESU AJAX RESOLVER v14)   ")
         print("==================================================")
         print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
         print("2. Stream Audio Saja (di Background Termux)")
