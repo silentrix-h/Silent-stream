@@ -17,7 +17,6 @@ def is_youtube(url):
     return any(yt in domain for yt in ["youtube.com", "youtu.be", "music.youtube.com"])
 
 def unpack_js_packer(html_text):
-    # Cari regex m3u8 / mp4 mentah
     direct_links = re.findall(r'https?://[^\s\'"]+\.(?:m3u8|mp4)[^\s\'"]*', html_text)
     if direct_links:
         return direct_links[0]
@@ -42,7 +41,7 @@ def extract_video_link(page_url):
         stream_url = unpack_js_packer(res.text)
         if stream_url:
             print(f"[✓] Ditemukan direct stream: {stream_url}")
-            return stream_url
+            return stream_url, page_url
 
         soup = BeautifulSoup(res.text, 'html.parser')
         for iframe in soup.find_all('iframe'):
@@ -62,36 +61,58 @@ def extract_video_link(page_url):
                 iframe_stream = unpack_js_packer(iframe_res.text)
                 if iframe_stream:
                     print(f"[✓] Berhasil membongkar stream: {iframe_stream}")
-                    return iframe_stream
+                    return iframe_stream, page_url
             except Exception:
                 continue
 
     except Exception as e:
         print(f"[!] Gagal ekstraksi web: {e}")
         
-    return None
+    return page_url, page_url
 
-def stream_media(url, player_mode="1"):
-    target_url = url
-    if not is_youtube(url) and not url.endswith(('.mp4', '.m3u8', '.mkv')):
-        extracted = extract_video_link(url)
-        if not extracted:
-            print("\n[!] Gagal mengambil stream dari halaman ini.")
-            return
-        target_url = extracted
-
-    print(f"\n[+] Membuka stream di Player HP: {target_url}\n")
+def get_youtube_stream_link(url, quality_choice="2"):
+    """Mengambil direct stream link YouTube menggunakan yt-dlp sesuai resolusi."""
+    print("[*] Mengambil link stream YouTube...")
+    res_map = {"1": "1080", "2": "720", "3": "480", "4": "360"}
+    res = res_map.get(quality_choice, "720")
+    fmt = f"bestvideo[height<={res}]+bestaudio/best[height<={res}]/best"
     
-    if player_mode == "1":
-        # Membuka langsung ke aplikasi Pemutar Video HP (VLC / MX Player / Bawaan Android)
-        cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", target_url, "-t", "video/*"]
+    cmd = ["yt-dlp", "-g", "-f", fmt, url]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        links = result.stdout.strip().split('\n')
+        return links[0] if links else url
+    except Exception:
+        return url
+
+def stream_media(url, quality_choice="2", audio_only=False):
+    referer = url
+    target_url = url
+
+    if is_youtube(url):
+        target_url = get_youtube_stream_link(url, quality_choice)
+    elif not url.endswith(('.mp4', '.m3u8', '.mkv')):
+        target_url, referer = extract_video_link(url)
+
+    print(f"\n[+] Membuka Video Player HP: {target_url}\n")
+    
+    if audio_only:
+        cmd = ["mpv", "--no-video", target_url]
     else:
-        # Membuka via MPV CLI Termux (Audio Only)
-        cmd = ["mpv", target_url]
+        # Kirim header Referer & User-Agent ke Intent Android agar tidak diblokir CDN server
+        headers_str = f"Referer: {referer},User-Agent: {HEADERS['User-Agent']}"
+        cmd = [
+            "am", "start",
+            "-a", "android.intent.action.VIEW",
+            "-d", target_url,
+            "-t", "video/*",
+            "--esa", "headers", headers_str,
+            "--esa", "input-headers", headers_str
+        ]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("[✓] Pemutar video berhasil dibuka di HP!\n")
+        print("[✓] Video Player berhasil dipanggil!\n")
     except Exception as e:
         print(f"[!] Gagal membuka player: {e}")
 
@@ -99,24 +120,43 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("      SILENT-STREAM (ANDROID PLAYER LAUNCHER)     ")
+        print("      SILENT-STREAM (STREAM PLAYER FIX v4)        ")
         print("==================================================")
-        print("1. Stream Video (Buka Aplikasi Video Player HP)")
-        print("2. Stream Audio Saja (di Background Termux)")
+        print("1. Stream Video (Buka di Video Player HP)")
+        print("2. Stream Audio Saja (Latar Belakang / MP3)")
         print("0. Keluar")
         
         choice = input("\nPilihan [1/2/0]: ").strip()
 
         if choice in ["0", "exit", "q"]:
             break
-        elif choice in ["1", "2"]:
+
+        elif choice == "1":
+            print("\n--- MODE STREAM VIDEO ---")
+            print("Pilih Resolusi Video (Khusus YouTube):")
+            print("1. 1080p (Full HD)")
+            print("2. 720p (HD)")
+            print("3. 480p")
+            print("4. 360p (Hemat Kuota)")
+            q_choice = input("Pilihan Resolusi [1-4] (default 2): ").strip() or "2"
+            
             while True:
                 print("\n--------------------------------------------------")
                 url = input("Tempel Link (atau ketik 'q' untuk ke Menu Utama): ").strip()
                 if url.lower() in ["q", "exit", "menu"]:
                     break
                 if url:
-                    stream_media(url, player_mode=choice)
+                    stream_media(url, quality_choice=q_choice, audio_only=False)
+
+        elif choice == "2":
+            print("\n--- MODE STREAM AUDIO SAJA ---")
+            while True:
+                print("\n--------------------------------------------------")
+                url = input("Tempel Link (atau ketik 'q' untuk ke Menu Utama): ").strip()
+                if url.lower() in ["q", "exit", "menu"]:
+                    break
+                if url:
+                    stream_media(url, audio_only=True)
 
 if __name__ == "__main__":
     main()
