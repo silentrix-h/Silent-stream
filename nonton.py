@@ -79,6 +79,18 @@ def is_episode_url(url):
             return True
     return False
 
+def extract_blogger_stream(url):
+    """Mengekstrak direct link googlevideo.com (.mp4) dari halaman iframe blogger.com."""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        text = res.text.replace('\\/', '/').replace('\\u003d', '=').replace('\\u0026', '&')
+        matches = re.findall(r'https?://[^\s\'"\\]*googlevideo\.com/videoplayback[^\s\'"\\]*', text)
+        if matches:
+            return matches[0]
+    except Exception:
+        pass
+    return None
+
 def scan_anime_episodes(anime_url):
     print("\n[*] Menganalisis halaman anime & memindai daftar episode...")
     try:
@@ -131,19 +143,21 @@ def unpack_general_stream(html_text):
     return None
 
 def resolve_otakudesu_ajax(page_url, data_content):
-    """Menembak AJAX wp-admin/admin-ajax.php Otakudesu untuk mengaktifkan tombol mirror."""
+    if not data_content:
+        return None
     try:
-        parsed_base = urlparse(page_url)
-        ajax_url = f"{parsed_base.scheme}://{parsed_base.netloc}/wp-admin/admin-ajax.php"
-        
         raw_decoded = data_content
         try:
             missing_padding = len(data_content) % 4
             if missing_padding:
                 data_content += '=' * (4 - missing_padding)
             raw_decoded = base64.b64decode(data_content).decode('utf-8', errors='ignore')
+            raw_decoded = raw_decoded.replace('\\/', '/')
         except Exception:
             pass
+
+        if raw_decoded.startswith('http'):
+            return raw_decoded
 
         payload = {}
         if raw_decoded.startswith('{'):
@@ -157,22 +171,24 @@ def resolve_otakudesu_ajax(page_url, data_content):
         if not payload:
             return None
 
+        parsed_base = urlparse(page_url)
+        ajax_url = f"{parsed_base.scheme}://{parsed_base.netloc}/wp-admin/admin-ajax.php"
+
         ajax_headers = HEADERS.copy()
         ajax_headers.update({
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": page_url
+            "Referer": page_url,
+            "Origin": f"{parsed_base.scheme}://{parsed_base.netloc}"
         })
 
         resp = requests.post(ajax_url, data=payload, headers=ajax_headers, timeout=10)
-        resp_text = resp.text
+        resp_text = resp.text.replace('\\/', '/')
 
-        # 1. Cari iframe src murni
         iframe_match = re.search(r'src=["\'](https?://[^"\'\s]+)["\']', resp_text)
         if iframe_match:
-            return iframe_match.group(1).replace('\\/', '/')
+            return iframe_match.group(1)
 
-        # 2. Dekode jika respon berupa HTML Base64
         b64_matches = re.findall(r'aHR0c[A-Za-z0-9+/=]+', resp_text)
         for b_str in b64_matches:
             missing = len(b_str) % 4
@@ -209,7 +225,7 @@ def extract_video_link(page_url):
         mirrors = []
         seen_urls = set()
 
-        # 1. Cari SEMUA elemen dengan data-content di seluruh halaman
+        # 1. Pindai semua elemen data-content (tombol mirror resolusi)
         elements = soup.select('[data-content]')
         for el in elements:
             data_content = el.get('data-content', '')
@@ -232,25 +248,22 @@ def extract_video_link(page_url):
 
                     label = f"{res_prefix}{name}"
                     
-                    # Utamakan server ondesuhd / desustream / odstream ke paling atas
                     if any(fav in name.lower() or fav in target_url.lower() for fav in ['ondesuhd', 'desustream', 'odstream']):
                         mirrors.insert(0, {'name': label, 'url': target_url})
                     else:
                         mirrors.append({'name': label, 'url': target_url})
 
-        # 2. Jika AJAX data-content tidak ditemukan, pindai semua <iframe> di halaman
-        if not mirrors:
-            for iframe in soup.find_all('iframe'):
-                src = iframe.get('src') or iframe.get('data-src') or ''
-                if src.startswith('//'):
-                    src = 'https:' + src
-                if src.startswith('http') and src not in seen_urls:
-                    if not any(ign in src.lower() for ign in ['facebook.com', 'discord.com', 'disqus.com']):
-                        seen_urls.add(src)
-                        domain = urlparse(src).netloc
-                        mirrors.append({'name': f"Default Player ({domain})", 'url': src})
+        # 2. Pindai iframe bawaan jika mirror AJAX tidak ditemukan
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src') or iframe.get('data-src') or ''
+            if src.startswith('//'):
+                src = 'https:' + src
+            if src.startswith('http') and src not in seen_urls:
+                if not any(ign in src.lower() for ign in ['facebook.com', 'discord.com', 'disqus.com']):
+                    seen_urls.add(src)
+                    domain = urlparse(src).netloc
+                    mirrors.append({'name': f"Default Player ({domain})", 'url': src})
 
-        # 3. Jika mirror ditemukan
         if mirrors:
             print(f"\n[✓] Ditemukan {len(mirrors)} Mirror Server Player:")
             for idx, m in enumerate(mirrors, 1):
@@ -267,18 +280,29 @@ def extract_video_link(page_url):
                     pass
 
             print(f"\n[*] Menguraikan stream dari player: {target_mirror[:60]}...")
-            
-            # Jika player dari Blogger/Google, langsung ekstrak via yt-dlp
-            if 'blogger.com' in target_mirror:
-                ytdlp_url = extract_via_ytdlp(target_mirror)
-                if ytdlp_url:
-                    print(f"[✓] Direct Stream Google/Blogger berhasil diekstrak!")
-                    return ytdlp_url, target_mirror
 
+            # Jika target merupakan Blogger (blogger.com), urai langsung stream .googlevideo.com (.mp4)
+            if 'blogger.com' in target_mirror:
+                print("[*] Membedah stream googlevideo (.mp4) dari Blogger...")
+                b_direct = extract_blogger_stream(target_mirror)
+                if b_direct:
+                    print(f"[✓] Direct Stream Google Video berhasil diekstrak!")
+                    return b_direct, target_mirror
+
+            # Jika player berupa server Desustream / Odstream / Vidhide
             try:
                 m_headers = HEADERS.copy()
                 m_headers["Referer"] = page_url
                 m_res = requests.get(target_mirror, headers=m_headers, timeout=10)
+
+                # Jika di dalam server desustream terdapat iframe Blogger
+                if 'blogger.com' in m_res.text:
+                    b_match = re.search(r'src=["\'](https?://www\.blogger\.com/[^"\'\s]+)["\']', m_res.text)
+                    if b_match:
+                        b_direct = extract_blogger_stream(b_match.group(1))
+                        if b_direct:
+                            print(f"[✓] Direct Stream Google Video berhasil diekstrak!")
+                            return b_direct, target_mirror
 
                 unpacked = unpack_general_stream(m_res.text)
                 if unpacked:
@@ -296,10 +320,6 @@ def extract_video_link(page_url):
 
     except Exception as e:
         print(f"[!] Gagal ekstraksi web: {e}")
-
-    ytdlp_fallback = extract_via_ytdlp(page_url)
-    if ytdlp_fallback:
-        return ytdlp_fallback, page_url
 
     return None, page_url
 
@@ -379,7 +399,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (UNIVERSAL AJAX TRIGGER v15)   ")
+        print("    SILENT-STREAM (BLOGGER DIRECT EXTRACT v16)   ")
         print("==================================================")
         print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
         print("2. Stream Audio Saja (di Background Termux)")
