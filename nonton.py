@@ -4,6 +4,7 @@ import re
 import sys
 import json
 import base64
+import tempfile
 import subprocess
 from urllib.parse import urlparse, unquote
 import requests
@@ -71,6 +72,10 @@ def is_youtube(url):
     domain = parsed.netloc.lower()
     return any(yt in domain for yt in ["youtube.com", "youtu.be", "music.youtube.com"])
 
+def is_spotify(url):
+    parsed = urlparse(url)
+    return "spotify.com" in parsed.netloc.lower()
+
 def is_episode_url(url):
     url_lower = url.lower()
     patterns = [r'/episode/', r'-episode-', r'-ep-\d+', r'/ep-\d+', r'episode-\d+', r'eps-\d+']
@@ -79,8 +84,102 @@ def is_episode_url(url):
             return True
     return False
 
+def build_spotify_m3u(spotify_url):
+    """Mengambil daftar judul lagu & artis dari link Spotify lalu membuat playlist .m3u untuk mpv."""
+    print("[*] Membaca daftar lagu dari Spotify...")
+    tracks = []
+    try:
+        # Gunakan halaman embed Spotify karena struktur HTML-nya lebih ringan dan memuat daftar lagu secara statis
+        embed_url = spotify_url.replace("open.spotify.com/", "open.spotify.com/embed/")
+        res = requests.get(embed_url, headers=HEADERS, timeout=12)
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        # 1. Coba ambil dari script JSON __NEXT_DATA__ milik Spotify Embed
+        next_data = soup.find('script', id='__NEXT_DATA__')
+        if next_data and next_data.string:
+            data = json.loads(next_data.string)
+            entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
+            track_list = entity.get('trackList', [])
+            for item in track_list:
+                title = item.get('title', '').strip()
+                subtitle = item.get('subtitle', '').strip()
+                if title:
+                    query = f"{title} - {subtitle}" if subtitle else title
+                    tracks.append(query)
+
+        # 2. Fallback: ambil dari meta tag halaman Spotify biasa jika single track
+        if not tracks:
+            res_main = requests.get(spotify_url, headers=HEADERS, timeout=12)
+            soup_main = BeautifulSoup(res_main.text, 'html.parser')
+            og_title = soup_main.find('meta', property='og:title')
+            og_desc = soup_main.find('meta', property='og:description')
+            if og_title and og_title.get('content'):
+                t_name = og_title['content']
+                artist = ""
+                if og_desc and og_desc.get('content'):
+                    # Biasanya formatnya: "Nama Artis · Song · Tahun"
+                    artist = og_desc['content'].split('·')[0].strip()
+                tracks.append(f"{t_name} - {artist}" if artist else t_name)
+
+    except Exception as e:
+        print(f"[!] Gagal membaca data Spotify: {e}")
+        return None, 0
+
+    if not tracks:
+        return None, 0
+
+    # Buat file playlist .m3u sementara
+    fd, m3u_path = tempfile.mkstemp(suffix=".m3u", prefix="silent_spotify_")
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write("#EXTM3U\n")
+        for idx, query in enumerate(tracks, 1):
+            f.write(f"#EXTINF:-1,{query}\n")
+            f.write(f"ytdl://ytsearch1:{query}\n")
+
+    return m3u_path, len(tracks)
+
+def play_audio_playlist(url, shuffle=False):
+    """Memutar audio tunggal maupun playlist YT Music / Spotify secara otomatis berlanjut."""
+    mpv_cmd = [
+        "mpv",
+        "--no-video",
+        "--ytdl-format=bestaudio/best",
+        "--term-osd-bar"
+    ]
+    if shuffle:
+        mpv_cmd.append("--shuffle")
+
+    temp_m3u = None
+
+    if is_spotify(url):
+        m3u_path, total = build_spotify_m3u(url)
+        if not m3u_path or total == 0:
+            print("[!] Tidak ada lagu yang berhasil diambil. Pastikan playlist Spotify bersifat Publik.\n")
+            return
+        print(f"[✓] Berhasil memuat {total} lagu dari Spotify!")
+        temp_m3u = m3u_path
+        mpv_cmd.append(m3u_path)
+    else:
+        if "list=" in url:
+            print("[*] Terdeteksi Playlist YouTube / YT Music! Lagu akan otomatis lanjut berurutan.")
+        mpv_cmd.append(url)
+
+    print("\n--- KONTROL PLAYER DI TERMINAL ---")
+    print(" [Enter] / [>] : Lagu berikutnya   |   [<] : Lagu sebelumnya")
+    print(" [Spasi]       : Pause / Resume    |   [q] : Berhenti\n")
+
+    try:
+        subprocess.run(mpv_cmd)
+    except FileNotFoundError:
+        print("[!] 'mpv' belum terpasang. Jalankan: pkg install mpv")
+    finally:
+        if temp_m3u and os.path.exists(temp_m3u):
+            try:
+                os.remove(temp_m3u)
+            except Exception:
+                pass
+
 def extract_blogger_stream(url):
-    """Mengekstrak direct link googlevideo.com (.mp4) dari halaman iframe blogger.com."""
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         text = res.text.replace('\\/', '/').replace('\\u003d', '=').replace('\\u0026', '&')
@@ -225,7 +324,6 @@ def extract_video_link(page_url):
         mirrors = []
         seen_urls = set()
 
-        # 1. Pindai semua elemen data-content (tombol mirror resolusi)
         elements = soup.select('[data-content]')
         for el in elements:
             data_content = el.get('data-content', '')
@@ -253,7 +351,6 @@ def extract_video_link(page_url):
                     else:
                         mirrors.append({'name': label, 'url': target_url})
 
-        # 2. Pindai iframe bawaan jika mirror AJAX tidak ditemukan
         for iframe in soup.find_all('iframe'):
             src = iframe.get('src') or iframe.get('data-src') or ''
             if src.startswith('//'):
@@ -281,7 +378,6 @@ def extract_video_link(page_url):
 
             print(f"\n[*] Menguraikan stream dari player: {target_mirror[:60]}...")
 
-            # Jika target merupakan Blogger (blogger.com), urai langsung stream .googlevideo.com (.mp4)
             if 'blogger.com' in target_mirror:
                 print("[*] Membedah stream googlevideo (.mp4) dari Blogger...")
                 b_direct = extract_blogger_stream(target_mirror)
@@ -289,13 +385,11 @@ def extract_video_link(page_url):
                     print(f"[✓] Direct Stream Google Video berhasil diekstrak!")
                     return b_direct, target_mirror
 
-            # Jika player berupa server Desustream / Odstream / Vidhide
             try:
                 m_headers = HEADERS.copy()
                 m_headers["Referer"] = page_url
                 m_res = requests.get(target_mirror, headers=m_headers, timeout=10)
 
-                # Jika di dalam server desustream terdapat iframe Blogger
                 if 'blogger.com' in m_res.text:
                     b_match = re.search(r'src=["\'](https?://www\.blogger\.com/[^"\'\s]+)["\']', m_res.text)
                     if b_match:
@@ -334,7 +428,7 @@ def get_youtube_direct_stream(url, mode="1"):
             return url
     return url
 
-def stream_media(url, yt_mode="1", audio_only=False):
+def stream_media(url, yt_mode="1"):
     target_url = url
     
     if not is_youtube(url) and not url.endswith(('.mp4', '.m3u8', '.mkv')):
@@ -384,25 +478,21 @@ def stream_media(url, yt_mode="1", audio_only=False):
 
     print(f"\n[+] Membuka Video Player HP: {play_url}\n")
     
-    if audio_only:
-        cmd = ["mpv", "--no-video", target_url]
-        subprocess.run(cmd)
-    else:
-        cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_url, "-t", "video/*"]
-        try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("[✓] Pemutar Video berhasil dibuka!\n")
-        except Exception as e:
-            print(f"[!] Gagal membuka player: {e}")
+    cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-d", play_url, "-t", "video/*"]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[✓] Pemutar Video berhasil dibuka!\n")
+    except Exception as e:
+        print(f"[!] Gagal membuka player: {e}")
 
 def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("    SILENT-STREAM (BLOGGER DIRECT EXTRACT v16)   ")
+        print("     SILENT-STREAM (AUDIO PLAYLIST ENGINE v17)    ")
         print("==================================================")
-        print("1. Stream Video (Halaman Utama Anime / Episode / YT)")
-        print("2. Stream Audio Saja (di Background Termux)")
+        print("1. Stream Video (Otakudesu / Episode / YT)")
+        print("2. Stream Audio & Playlist (YT Music / Spotify)")
         print("0. Keluar")
         
         choice = input("\nPilihan [1/2/0]: ").strip()
@@ -422,17 +512,20 @@ def main():
                 if url.lower() in ["q", "exit", "menu"]:
                     break
                 if url:
-                    stream_media(url, yt_mode=yt_mode, audio_only=False)
+                    stream_media(url, yt_mode=yt_mode)
 
         elif choice == "2":
-            print("\n--- MODE STREAM AUDIO SAJA ---")
+            print("\n--- MODE STREAM AUDIO & PLAYLIST ---")
+            shuffle_ans = input("Aktifkan mode Shuffle / Acak? [y/N]: ").strip().lower()
+            is_shuffle = (shuffle_ans == 'y')
+
             while True:
                 print("\n--------------------------------------------------")
-                url = input("Tempel Link (atau ketik 'q' untuk ke Menu Utama): ").strip()
+                url = input("Tempel Link Lagu/Playlist YT Music atau Spotify ('q' kembali): ").strip()
                 if url.lower() in ["q", "exit", "menu"]:
                     break
                 if url:
-                    stream_media(url, audio_only=True)
+                    play_audio_playlist(url, shuffle=is_shuffle)
 
 if __name__ == "__main__":
     main()
