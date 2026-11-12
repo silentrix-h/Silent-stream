@@ -6,7 +6,7 @@ import json
 import base64
 import tempfile
 import subprocess
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 import requests
 from bs4 import BeautifulSoup
 import http.server
@@ -77,7 +77,6 @@ def is_spotify(url):
     return "spotify.com" in parsed.netloc.lower()
 
 def extract_yt_video_id(url):
-    """Mengambil Video ID dari link YouTube / YT Music / youtu.be."""
     parsed = urlparse(url)
     if "youtu.be" in parsed.netloc.lower():
         return parsed.path.lstrip('/').split('/')[0]
@@ -87,7 +86,6 @@ def extract_yt_video_id(url):
     return None
 
 def search_yt_video_id(query):
-    """Mencari Video ID pertama di YouTube berdasarkan judul lagu."""
     try:
         cmd = ["yt-dlp", f"ytsearch1:{query}", "--print", "id", "--no-warnings"]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12)
@@ -105,12 +103,21 @@ def is_episode_url(url):
             return True
     return False
 
+def normalize_spotify_url(url):
+    """Membersihkan parameter ?si= dan prefix regional /intl-xx/ agar URL Spotify standar."""
+    clean = url.split('?')[0]
+    clean = re.sub(r'/intl-[a-zA-Z-]+/', '/', clean)
+    return clean
+
 def parse_spotify_url(spotify_url):
-    """Mengambil daftar lagu dari Spotify (bisa playlist/album maupun single track)."""
+    """Mengambil daftar lagu dari Spotify (mendukung /intl-id/, single track, album, & playlist)."""
     print("[*] Membaca informasi lagu dari Spotify...")
     tracks = []
+    clean_url = normalize_spotify_url(spotify_url)
+
     try:
-        embed_url = spotify_url.replace("open.spotify.com/", "open.spotify.com/embed/")
+        # 1. Coba melalui Spotify Embed (setelah /intl-id/ dibersihkan)
+        embed_url = clean_url.replace("open.spotify.com/", "open.spotify.com/embed/")
         res = requests.get(embed_url, headers=HEADERS, timeout=12)
         soup = BeautifulSoup(res.text, 'html.parser')
 
@@ -118,6 +125,8 @@ def parse_spotify_url(spotify_url):
         if next_data and next_data.string:
             data = json.loads(next_data.string)
             entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
+            
+            # Jika berupa playlist / album
             track_list = entity.get('trackList', [])
             for item in track_list:
                 title = item.get('title', '').strip()
@@ -125,19 +134,38 @@ def parse_spotify_url(spotify_url):
                 if title:
                     tracks.append(f"{title} - {subtitle}" if subtitle else title)
 
+            # Jika berupa single track di dalam entity
+            if not tracks and entity.get('name'):
+                t_name = entity.get('name', '').strip()
+                artists = [a.get('name', '') for a in entity.get('artists', []) if a.get('name')]
+                artist_str = ", ".join(artists)
+                tracks.append(f"{t_name} - {artist_str}" if artist_str else t_name)
+
+        # 2. Fallback via Endpoint Resmi oEmbed Spotify
         if not tracks:
-            res_main = requests.get(spotify_url, headers=HEADERS, timeout=12)
+            oembed_url = f"https://open.spotify.com/oembed?url={quote(clean_url)}"
+            ores = requests.get(oembed_url, headers=HEADERS, timeout=10)
+            if ores.status_code == 200:
+                odata = ores.json()
+                title = odata.get('title', '').strip()
+                if title:
+                    tracks.append(title)
+
+        # 3. Fallback terakhir via <title> halaman HTML utama
+        if not tracks:
+            res_main = requests.get(clean_url, headers=HEADERS, timeout=12)
             soup_main = BeautifulSoup(res_main.text, 'html.parser')
-            og_title = soup_main.find('meta', property='og:title')
-            og_desc = soup_main.find('meta', property='og:description')
-            if og_title and og_title.get('content'):
-                t_name = og_title['content']
-                artist = ""
-                if og_desc and og_desc.get('content'):
-                    artist = og_desc['content'].split('·')[0].strip()
-                tracks.append(f"{t_name} - {artist}" if artist else t_name)
+            if soup_main.title and soup_main.title.string:
+                # Biasanya format title: "Judul Lagu - song and lyrics by Nama Artis | Spotify"
+                raw_title = soup_main.title.string.replace("| Spotify", "").strip()
+                raw_title = re.sub(r'\s*-\s*song and lyrics by\s*', ' - ', raw_title, flags=re.IGNORECASE)
+                raw_title = re.sub(r'\s*-\s*Single by\s*', ' - ', raw_title, flags=re.IGNORECASE)
+                if raw_title and raw_title.lower() != "spotify":
+                    tracks.append(raw_title)
+
     except Exception as e:
         print(f"[!] Gagal membaca data Spotify: {e}")
+
     return tracks
 
 def build_m3u_from_tracks(tracks):
@@ -150,7 +178,6 @@ def build_m3u_from_tracks(tracks):
     return m3u_path
 
 def play_audio_playlist(url, shuffle=False, auto_radio=True):
-    """Memutar audio tunggal (dengan Auto-Radio) maupun playlist YT Music / Spotify."""
     mpv_cmd = [
         "mpv",
         "--no-video",
@@ -171,7 +198,7 @@ def play_audio_playlist(url, shuffle=False, auto_radio=True):
             return
 
         if len(tracks) == 1 and auto_radio:
-            print(f"[*] Lagu tunggal terdeteksi: '{tracks[0]}'")
+            print(f"[✓] Lagu ditemukan: '{tracks[0]}'")
             print("[*] Mengaktifkan Auto-Radio YouTube Music untuk lagu lanjutan...")
             vid_id = search_yt_video_id(tracks[0])
             if vid_id:
@@ -520,7 +547,7 @@ def main():
     while True:
         os.system('clear' if os.name == 'posix' else 'cls')
         print("==================================================")
-        print("     SILENT-STREAM (AUTO-RADIO & STREAM v18)      ")
+        print("     SILENT-STREAM (SPOTIFY INTL-ID & RADIO v19)  ")
         print("==================================================")
         print("1. Stream Video (Otakudesu / Episode / YT)")
         print("2. Stream Audio & Auto-Radio (YT Music / Spotify)")
